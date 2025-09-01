@@ -57,7 +57,7 @@ class Qwen(LLM, ABC):   # 继承自 LLM 和 ABC，LLM是 LangChain 提供的基�
         model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
         generated_ids = model.generate(
             **model_inputs,
-            max_new_tokens=512
+            max_new_tokens=4096
         )
         generated_ids = [
             output_ids[len(input_ids):] for input_ids, output_ids in zip(model_inputs.input_ids, generated_ids)
@@ -130,36 +130,6 @@ def write_check_file(filepath, docs):
         fout.close()
 
 
-# 这样处理后，每个元素就是一个完整的句子（含标点），便于后续中文文本处理。
-class ChineseTextSplitter(CharacterTextSplitter):
-    def __init__(self, pdf: bool = False, **kwargs):
-        super().__init__(**kwargs)
-        self.pdf = pdf
-
-    def split_text(self, text: str) -> List[str]:
-        if self.pdf:
-            # 将多个换行符替换为一个换行符
-            text = re.sub(r"\n{3,}", "\n", text)
-            # 将空白字符替换为一个空格
-            text = re.sub('\s', ' ', text)
-            # 将所有连续的两个换行符删除
-            text = text.replace("\n\n", "")
-
-        sent_sep_pattern = re.compile(
-            r'([。；？！!?]["'"」』]{0,2}|(?<=[。；？！!?]["'"」』]{0,2})(?=[^a-zA-Z0-9_"\'《〈（\[】）〉》"'']))'
-        )
-        sent_list = []
-        for ele in sent_sep_pattern.split(text):
-            if sent_sep_pattern.match(ele) and sent_list:
-                sent_list[-1] += ele
-            elif ele:
-                sent_list.append(ele)
-        return sent_list
-    
-
-
-
-
 
 EMBEDDING_MODEL = 'bge-base-zh-v1.5'
 # Embedding running device
@@ -187,7 +157,7 @@ def separate_list(ls: List[int]) -> List[List[int]]:
 
 # 继承自FAISS，后者是 LangChain 框架中用于向量检索的类，底层封装了 Facebook 的 FAISS 库，实现高效的向量相似度搜索。
 class FAISSWrapper(FAISS):
-    chunk_size = 250 # chunk的最大长度，超过该长度就不再合并相邻的chunk
+    chunk_size = 1000 # chunk的最大长度，超过该长度就不再合并相邻的chunk
     chunk_conent = True # 是否将相邻的chunk合并成一个文档返回
     score_threshold = 0 # 相似度阈值，低于该值的结果会被过滤掉
 
@@ -196,6 +166,12 @@ class FAISSWrapper(FAISS):
     def similarity_search_with_score_by_vector(
         self, embedding: List[float], k: int = 4
     ) -> List[Tuple[Document, float]]:
+        
+        print("测试，本函数被执行")
+        if self.chunk_conent: 
+            print("合并chunk")
+        else: 
+            print("不合并chunk")
         # self.index 是 FAISS 库中的索引对象，search 方法用于在索引中查找与给定向量最相似的 k 个向量
         # 返回的 scores 是相似度分数(越小越相似，因为返回的是距离值)，indices 是对应的向量索引
         # np.array([embedding], dtype=np.float32) 将输入的嵌入向量转换为 NumPy 数组，确保数据类型为 float32
@@ -213,69 +189,75 @@ class FAISSWrapper(FAISS):
             # 或者者相似度分数低于设定的阈值，其实是距离值高于设定的阈值
             if i == -1 or 0 < self.score_threshold < scores[0][j]:
                 continue
+
+            id_set.add(i)
+            # 如果不需要合并相邻的chunk，直接进入下一轮循环
+            if not self.chunk_conent:
+                continue
+
             # 根据向量索引找到对应的文档ID
             _id = self.index_to_docstore_id[i]
             # 根据文档ID从文档存储中检索出完整的文档内容
             doc = self.docstore.search(_id)
-            # 如果不需要合并相邻的chunk，直接把当前文档添加到结果列表中
-            if not self.chunk_conent:
-                if not isinstance(doc, Document):
-                    raise ValueError(f"Could not find document for id {_id}, got {doc}")
-                doc.metadata["score"] = int(scores[0][j])
-                docs.append(doc)
-                continue
-            # 如果需要合并相邻的chunk，先把当前文档的索引添加到id_set中
-            id_set.add(i)
             docs_len = len(doc.page_content)
+            # 分别向前向后扩展，避免一个方向的停止影响另一个方向
+            forward_stopped = False
+            backward_stopped = False
             for k in range(1, max(i, store_len - i)):
-                break_flag = False
-                # 同时向前和向后检查相邻的chunk
-                for l in [i + k, i - k]:
-                    if 0 <= l < len(self.index_to_docstore_id):
-                        # 根据索引找到对应的文档ID和文档内容
-                        _id0 = self.index_to_docstore_id[l]
-                        doc0 = self.docstore.search(_id0)
-                        # 如果合并后的长度超过设定的chunk_size，或者者者不是同一个文档，就停止合并
-                        if docs_len + len(doc0.page_content) > self.chunk_size:
-                            break_flag = True
-                            break
-                        # 确保是同一个文档
-                        elif doc0.metadata["source"] == doc.metadata["source"]:
-                            docs_len += len(doc0.page_content)
-                            id_set.add(l)
-                if break_flag:
+                if forward_stopped and backward_stopped:
                     break
-
-            # if not self.chunk_conent:
-            #     return docs
-            # if len(id_set) == 0 and self.score_threshold > 0:
-            #     return []
-            # 将id_set转换为有序列表，方便后续处理
-            id_list = sorted(list(id_set))
-            # 将连续的索引分割成多个子列表，方便合并相邻的chunk
-            id_lists = separate_list(id_list)
-            for id_seq in id_lists:
-                for id in id_seq:
-                    if id == id_seq[0]:
-                        _id = self.index_to_docstore_id[id]
-                        doc = self.docstore.search(_id)
+                # 向下检查相邻的chunk
+                if not forward_stopped and i + k < len(self.index_to_docstore_id):
+                    _id0 = self.index_to_docstore_id[i + k]
+                    doc0 = self.docstore.search(_id0)
+                    if docs_len + len(doc0.page_content) > self.chunk_size:
+                        forward_stopped = True
+                    elif doc0.metadata["source"] == doc.metadata["source"]:
+                        docs_len += len(doc0.page_content)
+                        id_set.add(i + k)
                     else:
-                        _id0 = self.index_to_docstore_id[id]
-                        doc0 = self.docstore.search(_id0)
-                        # page_content 是 Document 类中的属性，表示文档的内容
-                        doc.page_content += " " + doc0.page_content
+                        forward_stopped = True   
+                # 向上检查相邻的chunk
+                if not backward_stopped and i - k >= 0:
+                    _id0 = self.index_to_docstore_id[i - k]
+                    doc0 = self.docstore.search(_id0)
+                    if docs_len + len(doc0.page_content) > self.chunk_size:
+                        backward_stopped = True
+                    elif doc0.metadata["source"] == doc.metadata["source"]:
+                        docs_len += len(doc0.page_content)
+                        id_set.add(i - k)
 
-                # 确保 doc 是 Document 类型的实例，防御性编程
-                if not isinstance(doc, Document):
-                    raise ValueError(f"Could not find document for id {_id}, got {doc}")
-                # 如果被合并的文档位于K个相似文档中，就取它们的最低分数作为合并后文档的分数
-                # .index(i) 是找到元素 i 在 indices[0] 中的下标，从而获取对应的分数
-                doc_score = min([scores[0][id] for id in [indices[0].tolist().index(i) for i in id_seq if i in indices[0]]])
-                doc.metadata["score"] = int(doc_score)
-                docs.append((doc, doc_score))
-            for doc in docs:
-                print(doc[0].metadata['source'], doc[0].metadata['score'], len(doc[0].page_content))
-            return docs
+        # 将id_set转换为有序列表，方便后续处理
+        id_list = sorted(list(id_set))
+        # 将连续的索引分割成多个子列表，方便合并相邻的chunk
+        id_lists = separate_list(id_list)
+        print("id_lists=", id_lists)
+        docs_len = 0 # 调试
+        for id_seq in id_lists:
+            doc = None
+            for id in id_seq:
+                if id == id_seq[0]:
+                    _id = self.index_to_docstore_id[id]
+                    doc = self.docstore.search(_id)
+                else:
+                    _id0 = self.index_to_docstore_id[id]
+                    doc0 = self.docstore.search(_id0)
+                    # page_content 是 Document 类中的属性，表示文档的内容
+                    doc.page_content += " " + doc0.page_content
+
+            # 确保 doc 是 Document 类型的实例，防御性编程
+            if not isinstance(doc, Document):
+                raise ValueError(f"Could not find document for id {_id}, got {doc}")
+            # 如果被合并的文档位于K个相似文档中，就取它们的最低分数作为合并后文档的分数
+            # .index(i) 是找到元素 i 在 indices[0] 中的下标，从而获取对应的分数
+            doc_score = min([scores[0][id] for id in [indices[0].tolist().index(i) for i in id_seq if i in indices[0]]])
+            doc.metadata["score"] = int(doc_score)
+            docs_len += len(doc.page_content)
+            print("====================")
+            print("docs_len=", docs_len)
+            print(doc.page_content)
+            docs.append((doc, doc_score))
+        return docs
 
 
 
@@ -289,7 +271,7 @@ if __name__ == '__main__':
 Based on the above known information, respond to the user's question concisely and professionally. If an answer cannot be derived from it, say 'The question cannot be answered with the given information' or 'Not enough relevant information has been provided,' and do not include fabricated details in the answer. Please respond in Chinese. The question is {question}"""
 
     # 表示每次向量检索时，返回相似度最高的前3个文档片段（top-k 检索）。
-    VECTOR_SEARCH_TOP_K = 3
+    VECTOR_SEARCH_TOP_K = 5
     # LangChain 问答链的链类型参数，'stuff' 表示将所有检索到的文档内容“拼接”在一起后统一交给大模型生成答案。这是最常用、最简单的一种链式问答方式。
     CHAIN_TYPE = 'stuff'
     llm = Qwen()
@@ -314,5 +296,5 @@ Based on the above known information, respond to the user's question concisely a
         chain_type_kwargs=chain_type_kwargs
     )
 
-    query = "请简要介绍下江吟风"
+    query = "涤罪僧会是韶华轻掷那个女人的父亲吗？"
     print(qa.run(query))
